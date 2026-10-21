@@ -9,11 +9,12 @@ A Salesforce Apex integration that brings [Givebutter](https://givebutter.com) f
 
 ## Table of contents
 
+0. [How it works, in plain English](#0-how-it-works-in-plain-english)
 1. [Overview and objectives](#1-overview-and-objectives)
 2. [Architecture and data flow](#2-architecture-and-data-flow)
 3. [Integration approaches: webhook vs. API](#3-integration-approaches-webhook-vs-api)
 4. [Repository contents (Apex classes)](#4-repository-contents-apex-classes)
-5. [Salesforce data model](#5-salesforce-data-model)
+5. [Salesforce objects and fields used](#5-salesforce-objects-and-fields-used)
 6. [Field mappings](#6-field-mappings)
 7. [Authentication and Named Credentials](#7-authentication-and-named-credentials)
 8. [Installation, configuration and deployment](#8-installation-configuration-and-deployment)
@@ -23,6 +24,60 @@ A Salesforce Apex integration that brings [Givebutter](https://givebutter.com) f
 12. [Testing and example workflows](#12-testing-and-example-workflows)
 13. [Security considerations](#13-security-considerations)
 14. [Known limitations and recommended improvements](#14-known-limitations-and-recommended-improvements)
+
+---
+
+## 0. How it works, in plain English
+
+*(Start here if you are not a developer. The technical sections follow.)*
+
+**The problem this solves.** A nonprofit collects donations through Givebutter (online giving pages, recurring plans, refunds). The finance and fundraising teams work in Salesforce. Without this integration, someone would have to retype every donor and donation by hand. This project does that automatically and checks the result.
+
+**Think of it as a mail room:**
+
+| Real-world role | What it is in this project |
+|---|---|
+| A courier arrives with a sealed package | Givebutter sends a **webhook** (an automatic message: "a donation just happened") |
+| The front desk checks the courier's ID | The code checks the **signing secret** so only Givebutter is accepted |
+| The package is logged in a ledger before anyone opens it | The message is saved as a **staging record** (`Givebutter_Event_Staging__c`) |
+| A clerk opens the package and files the contents | A background job (**`GivebutterEventProcessor`**) creates the donor, gift, campaign, etc. in Salesforce |
+| If the clerk hits a temporary problem, they try again later | **Automatic retries** (after 5, 15, 60, then 240 minutes) |
+| If the paperwork is wrong, it is set aside for a human to fix | Status **Failed**; an admin fixes the cause and clicks **Reprocess** |
+| At the end of the day, the accountant counts both ledgers | **Reconciliation** compares Givebutter's transactions with Salesforce's |
+
+**What happens when someone donates (step by step):**
+
+1. A donor gives $50 on a Givebutter page.
+2. Givebutter immediately sends Salesforce a message describing the donor and the donation.
+3. Salesforce checks the message is genuinely from Givebutter, saves a copy, and replies "got it" within moments.
+4. In the background, Salesforce finds or creates the **donor** (a Person Account), then creates the **Gift Transaction** for $50, linked to the donor, the campaign and the fund.
+5. If anything goes wrong, the copy of the message is kept, the reason is recorded, and the system either retries automatically or waits for an admin.
+6. Later, the reconciliation job asks Givebutter "what transactions happened on this date?" and confirms every one is in Salesforce with the same amount.
+
+**Two safety nets** protect against lost or duplicated data: every message has a unique ID so it is never processed twice, and every record is matched on its Givebutter ID so re-running never creates a second copy of a donor or gift.
+
+**What it does *not* do:** it does not delete anything, does not fix mismatches by itself, and only creates the Campaign and Fund in Givebutter when a Flow tells it to.
+
+### Glossary
+
+| Term | Meaning |
+|---|---|
+| **Webhook** | An automatic message one system sends another when something happens ("push" instead of asking repeatedly) |
+| **API** | A way for one system to ask another for data or ask it to do something |
+| **Polling** | Asking an API for data on a schedule (used here for reconciliation) |
+| **Named Credential** | Salesforce's safe place to store how to log in to an outside service, so no password is in the code |
+| **Custom Metadata** | Admin-managed settings stored in Salesforce (used here for the signing secret) |
+| **Apex** | Salesforce's programming language |
+| **Queueable** | An Apex job that runs in the background, after the main request has finished |
+| **Schedulable** | An Apex job that runs at a set time |
+| **Staging record** | A saved copy of an incoming message, kept before it is processed |
+| **Idempotent** | Safe to run twice: the second run changes nothing |
+| **Person Account** | Salesforce's record type for an individual person (a donor) |
+| **Gift Transaction** | One donation payment |
+| **Gift Commitment** | A recurring-giving promise (a Givebutter "plan") |
+| **Gift Designation** | Where a gift is directed (a Givebutter "fund") |
+| **Reconciliation** | Comparing two sets of records to confirm they agree |
+| **Flow** | Salesforce's no-code automation tool |
 
 ---
 
@@ -167,50 +222,129 @@ All classes are flat in the repository root, each with a `.cls-meta.xml` (API 67
 
 ---
 
-## 5. Salesforce data model
+## 5. Salesforce objects and fields used
 
-### Standard objects used
+This section lists **every object and field the code touches**. "Type" is inferred from how the code uses the field (the repo does not contain the field definitions), so match it when you create them. **R** = the code reads it, **W** = the code writes it.
 
-These come from **Nonprofit Cloud / Fundraising** and require **Person Accounts**: `Account` (Person Account), `Campaign`, `GiftTransaction`, `GiftTransactionDesignation`, `GiftDesignation`, `GiftDefaultDesignation`, `GiftCommitment`, `GiftCommitmentSchedule` (through the standard invocable action `manageRcrGiftCmtSchd`), and `GiftRefund`.
+**Prerequisites:** Nonprofit Cloud / Fundraising, **Person Accounts**, and **multi-currency** (the code sets `CurrencyIsoCode`).
 
-The transaction and commitment code sets `CurrencyIsoCode`, so the org also needs **multiple currencies enabled** for the code to compile and deploy.
+### 5.1 Objects at a glance
 
-### Custom objects
+| Object | Standard / Custom | Role in the integration |
+|---|---|---|
+| `Givebutter_Event_Staging__c` | Custom | Inbox of webhook messages and their processing state |
+| `Givebutter_Integration_Error__c` | Custom | Log of each failed processing attempt |
+| `Givebutter_Reconciliation__c` | Custom | Summary of each reconciliation run |
+| `Givebutter_Settings__mdt` | Custom Metadata | Holds the webhook signing secret |
+| `Account` (Person Account) | Standard | The donor |
+| `Campaign` | Standard | A Givebutter campaign |
+| `GiftTransaction` | Standard (Fundraising) | One donation |
+| `GiftTransactionDesignation` | Standard (Fundraising) | How a donation is split across funds |
+| `GiftDesignation` | Standard (Fundraising) | A Givebutter fund |
+| `GiftDefaultDesignation` | Standard (Fundraising) | A campaign's default fund |
+| `GiftCommitment` | Standard (Fundraising) | A recurring plan |
+| `GiftCommitmentSchedule` | Standard (Fundraising) | The plan's billing schedule (written through the standard action `manageRcrGiftCmtSchd`) |
+| `GiftRefund` | Standard (Fundraising) | A refund against a donation |
+| `RecordType` | Standard | Read once to find the Person Account record type |
 
-**`Givebutter_Event_Staging__c`** – one row per webhook event
+### 5.2 Custom objects: all fields
 
-| Field | Purpose |
+**`Givebutter_Event_Staging__c`** (the inbox)
+
+| Field | Type (inferred) | Plain meaning | Used by |
+|---|---|---|---|
+| `Givebutter_Event_Id__c` | Text, **Unique** | Givebutter's ID for the message; prevents double-processing | W/R: Webhook |
+| `Event_Type__c` | Text | What happened, e.g. `transaction.succeeded` | W: Webhook; R: Reprocess |
+| `Payload__c` | Long text | The complete original message (JSON) | W/R: Webhook |
+| `Status__c` | Picklist/Text | `Received`, `Processing`, `Processed`, `Retry Pending`, `Failed` | W/R: Webhook, RetryScheduler, Reprocess |
+| `Received_At__c` | DateTime | When Salesforce got it | W: Webhook |
+| `Processing_Started__c` | DateTime | When processing began | W: Webhook |
+| `Processed_At__c` | DateTime | When it finished successfully | W: Webhook |
+| `Givebutter_Record_Id__c` | Text | The Givebutter ID of the thing in the message (contact, campaign, etc.) | W: Webhook; R: Reprocess |
+| `Salesforce_Record_Id__c` | Text/ID | The main Salesforce record created or updated | W: Webhook |
+| `Retry_Count__c` | Number | How many retries so far | W/R: Webhook, RetryScheduler |
+| `Next_Retry_At__c` | DateTime | When the next automatic retry is due | W/R: Webhook, RetryScheduler, Reprocess |
+| `Retry_Reason__c` | Text | Why a retry was scheduled | W: Webhook |
+| `Error_Message__c` | Text/Long text | Latest error message | W: Webhook |
+| `Error_Category__c` | Picklist | `Transient` (try again) or `Permanent` (needs a human) | W: Webhook |
+| `Reprocess_Requested__c` | Checkbox | Admin ticks this to allow a reprocess | R/W: Reprocess |
+
+**`Givebutter_Integration_Error__c`** (the error log)
+
+| Field | Type (inferred) | Plain meaning | Used by |
+|---|---|---|---|
+| `Givebutter_Event__c` | Lookup → Staging | Which event failed | W: Webhook |
+| `Error_Type__c` | Picklist | `Authentication`, `Configuration`, `Salesforce DML`, `Unknown` | W: Webhook |
+| `Error_Message__c` | Text/Long text | What went wrong | W: Webhook |
+| `Stack_Trace__c` | Long text | Technical trace for developers | W: Webhook |
+| `Retry_Number__c` | Number | Which attempt this was | W: Webhook |
+
+**`Givebutter_Reconciliation__c`** (reconciliation run summary)
+
+| Field | Type (inferred) | Plain meaning | Used by |
+|---|---|---|---|
+| `Run_Date__c` | DateTime | When the run happened | W: ReconciliationProcessor |
+| `From_Date__c`, `To_Date__c` | Date | Date range checked | W: ReconciliationProcessor |
+| `Givebutter_Count__c`, `Givebutter_Total__c` | Number / Currency | Number and total amount of transactions in Givebutter | W: ReconciliationProcessor |
+| `Salesforce_Count__c`, `Salesforce_Total__c` | Number / Currency | Same, for Salesforce | W: ReconciliationProcessor |
+| `Matched_Count__c` | Number | Transactions that agree | W: ReconciliationProcessor |
+| `Mismatch_Count__c` | Number | Same ID, different amount | W: ReconciliationProcessor |
+| `Missing_Count__c` | Number | In Givebutter, not in Salesforce | W: ReconciliationProcessor |
+| `Corrected_Count__c`, `Error_Count__c` | Number | Always written as 0 today (reserved) | W: ReconciliationProcessor |
+| `Status__c` | Picklist | `Completed` or `Completed with Errors` | W: ReconciliationProcessor |
+| `Error_Details__c` | Long text | Lists the missing and mismatched IDs | W: ReconciliationProcessor |
+
+**`Givebutter_Settings__mdt`** (Custom Metadata): record name `Default`, field `Signing_Secret__c` (Text). Read by `GivebutterSettingsService` and `GivebutterWebhook`.
+
+### 5.3 Custom fields added to standard objects
+
+| Object | Field | Type (inferred) | Plain meaning | Used by |
+|---|---|---|---|---|
+| `Account` | `Givebutter_Contact_ID__c` | Text | The donor's ID in Givebutter (the link between the two systems) | R/W: Webhook |
+| `Campaign` | `Givebutter_Campaign_ID__c` | Text | Campaign ID in Givebutter | R/W: Webhook, CampaignApiService; R: FundApiService |
+| `Campaign` | `Givebutter_Campaign_Code__c` | Text | Campaign code | W: Webhook |
+| `GiftDesignation` | `Givebutter_Fund_ID__c` | Text | Fund ID in Givebutter | R/W: Webhook, FundApiService |
+| `GiftDesignation` | `Givebutter_Fund_Code__c` | Text | Fund code | R/W: Webhook; R: FundApiService |
+| `GiftDesignation` | `Givebutter_Fund_Name__c` | Text | Fund name | R/W: Webhook; R: FundApiService |
+| `GiftTransaction` | `Givebutter_Transaction_ID__c` | Text | Transaction ID in Givebutter | R/W: Webhook; R: ReconciliationProcessor, refund logic |
+| `GiftTransaction` | `Givebutter_Transaction_Number__c` | Text | Human-friendly transaction number | W: Webhook |
+| `GiftTransaction` | `Givebutter_Donated_Amount__c` | Currency | Amount actually donated (excludes covered fees); used for reconciliation | W: Webhook; R: ReconciliationProcessor |
+| `GiftTransaction` | `Givebutter_Payout_Amount__c` | Currency | Amount paid out to the nonprofit | W: Webhook |
+| `GiftTransaction` | `Givebutter_Fair_Market_Value__c` | Currency | Fair market value of any benefit given to the donor | W: Webhook |
+| `GiftTransaction` | `Reconciliation_Status__c` | Picklist | `Matched` or `Mismatch` | W: ReconciliationProcessor |
+| `GiftTransaction` | `Last_Reconciliation_Date__c` | Date | Last date it was checked | W: ReconciliationProcessor |
+| `GiftTransaction` | `Givebutter_Reconciliation__c` | Lookup → Reconciliation | The run that flagged this as a mismatch | W: ReconciliationProcessor |
+| `GiftCommitment` | `Givebutter_Plan_ID__c` | Text | Recurring plan ID in Givebutter | R/W: Webhook |
+| `GiftCommitmentSchedule` | `Givebutter_Plan_ID__c` | Text | Plan ID, passed to the standard action | W: Webhook |
+| `GiftRefund` | `Givebutter_Refund_ID__c` | Text | Refund ID in Givebutter | R/W: Webhook |
+| `GiftRefund` | `Givebutter_Transaction_ID__c` | Text | Which Givebutter transaction was refunded | W: Webhook |
+| `GiftRefund` | `Givebutter_Refund_Amount__c` | Currency | Refund amount as reported by Givebutter | W: Webhook |
+
+### 5.4 Standard fields used
+
+| Object | Fields the code sets or reads |
 |---|---|
-| `Givebutter_Event_Id__c` | Givebutter event ID. **Must be Unique** (the code relies on this for duplicate delivery). |
-| `Event_Type__c` | e.g. `transaction.succeeded` |
-| `Payload__c` | Original request body (JSON) |
-| `Status__c` | `Received`, `Processing`, `Processed`, `Retry Pending`, `Failed` |
-| `Received_At__c`, `Processing_Started__c`, `Processed_At__c` | Timestamps |
-| `Givebutter_Record_Id__c` | `data.id` from the payload (contact/campaign/transaction/etc.) |
-| `Salesforce_Record_Id__c` | Primary Salesforce record written |
-| `Retry_Count__c`, `Next_Retry_At__c`, `Retry_Reason__c` | Retry state |
-| `Error_Message__c`, `Error_Category__c` | Last error; category is `Transient` or `Permanent` (picklist) |
-| `Reprocess_Requested__c` | Checkbox that gates manual reprocessing |
+| `Account` | `RecordTypeId`, `IsPersonAccount`, `FirstName`, `LastName`, `PersonEmail`, `PersonMobilePhone` |
+| `Campaign` | `Name`, `Description` |
+| `GiftTransaction` | `Name`, `DonorId`, `OriginalAmount`, `PaymentMethod`, `PaymentIdentifier`, `ProcessorReference`, `TransactionDate`, `Status`, `CurrencyIsoCode`, `ProcessorTransactionFee`, `DonorCoverAmount`, `CampaignId`, `Description`; read-only: `IsPartiallyRefunded`, `RefundedAmount` |
+| `GiftTransactionDesignation` | `GiftTransactionId`, `GiftDesignationId`, `Amount`, `Percent` |
+| `GiftDesignation` | `Name`, `IsActive` (also reads `Description`) |
+| `GiftDefaultDesignation` | `ParentRecordId`, `GiftDesignationId`, `AllocatedPercentage` |
+| `GiftCommitment` | `Name`, `DonorId`, `NextTransactionAmount`, `NextTransactionDate`, `EffectiveStartDate`, `RecurrenceType`, `Status`, `CurrencyIsoCode`, `Description` |
+| `GiftCommitmentSchedule` (via action input) | `GiftCommitmentId`, `StartDate`, `TransactionAmount`, `TransactionInterval`, `TransactionPeriod`, `TransactionDay`, `PaymentMethod`, `EndDate` |
+| `GiftRefund` | `GiftTransactionId`, `Amount`, `Date`, `Reason`, `Status` |
 
-**`Givebutter_Integration_Error__c`** – one row per failed attempt: `Givebutter_Event__c` (lookup to staging), `Error_Type__c` (`Authentication`, `Configuration`, `Salesforce DML`, `Unknown`), `Error_Message__c`, `Stack_Trace__c`, `Retry_Number__c`.
+### 5.5 Which object each event touches
 
-**`Givebutter_Reconciliation__c`** – one row per reconciliation run: `Run_Date__c`, `From_Date__c`, `To_Date__c`, `Givebutter_Count__c`, `Givebutter_Total__c`, `Salesforce_Count__c`, `Salesforce_Total__c`, `Matched_Count__c`, `Missing_Count__c`, `Mismatch_Count__c`, `Corrected_Count__c`, `Error_Count__c`, `Status__c`, `Error_Details__c`.
-
-### Custom fields on standard objects
-
-| Object | Fields |
+| Event | Objects written |
 |---|---|
-| `Account` | `Givebutter_Contact_ID__c` |
-| `Campaign` | `Givebutter_Campaign_ID__c`, `Givebutter_Campaign_Code__c` |
-| `GiftDesignation` | `Givebutter_Fund_ID__c`, `Givebutter_Fund_Code__c`, `Givebutter_Fund_Name__c` |
-| `GiftTransaction` | `Givebutter_Transaction_ID__c`, `Givebutter_Transaction_Number__c`, `Givebutter_Donated_Amount__c`, `Givebutter_Payout_Amount__c`, `Givebutter_Fair_Market_Value__c`, `Reconciliation_Status__c`, `Last_Reconciliation_Date__c`, `Givebutter_Reconciliation__c` (lookup) |
-| `GiftCommitment` | `Givebutter_Plan_ID__c` |
-| `GiftCommitmentSchedule` | `Givebutter_Plan_ID__c` (passed to the standard action) |
-| `GiftRefund` | `Givebutter_Refund_ID__c`, `Givebutter_Transaction_ID__c`, `Givebutter_Refund_Amount__c` |
-
-### Custom Metadata
-
-**`Givebutter_Settings__mdt`**, a record with DeveloperName **`Default`**, field `Signing_Secret__c`.
+| `contact.created` | Account |
+| `transaction.succeeded` | Account (if donor is new), GiftTransaction, GiftDesignation, GiftTransactionDesignation |
+| `campaign.created` / `campaign.updated` | Campaign, GiftDesignation, GiftDefaultDesignation |
+| `plan.*` | Account (if donor is new), GiftCommitment, GiftCommitmentSchedule |
+| `refund.created` | GiftRefund |
+| *every event* | Givebutter_Event_Staging__c (always); Givebutter_Integration_Error__c (on failure) |
+| Reconciliation run | Givebutter_Reconciliation__c, GiftTransaction (status fields) |
 
 ---
 
@@ -347,7 +481,7 @@ The REST resource is `@RestResource(urlMapping='/givebutter/webhook/*')`, so the
 
 ### Steps
 
-1. **Create the metadata the code depends on** (not included in this repo): the custom objects and fields in [§5](#5-salesforce-data-model). Mark `Givebutter_Event_Staging__c.Givebutter_Event_Id__c` as **Unique**. Make sure `Status__c` and `Error_Category__c` picklists contain the values listed in §5 and §10.
+1. **Create the metadata the code depends on** (not included in this repo): the custom objects and fields in [§5](#5-salesforce-objects-and-fields-used). Mark `Givebutter_Event_Staging__c.Givebutter_Event_Id__c` as **Unique**. Make sure `Status__c` and `Error_Category__c` picklists contain the values listed in §5 and §10.
 2. **Create the Custom Metadata** type `Givebutter_Settings__mdt` with a text field `Signing_Secret__c`, then create a record named `Default`. Enter the signing secret **in Setup**, not in a file you commit.
 3. **Configure authentication**: the External Credential, Named Credential `Givebutter_API`, and permission set from [§7.1](#71-outbound-api-calls-named-credential-givebutter_api).
 4. **Deploy the Apex.** The repo is a flat folder of classes. Place them in a standard SFDX project and deploy:
