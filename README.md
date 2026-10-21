@@ -9,7 +9,7 @@ A Salesforce Apex integration that brings [Givebutter](https://givebutter.com) f
 
 ## Table of contents
 
-0. [How it works, in plain English](#0-how-it-works-in-plain-english)
+0. [How it works](#0-how-it-works)
 1. [Overview and objectives](#1-overview-and-objectives)
 2. [Architecture and data flow](#2-architecture-and-data-flow)
 3. [Integration approaches: webhook vs. API](#3-integration-approaches-webhook-vs-api)
@@ -27,7 +27,7 @@ A Salesforce Apex integration that brings [Givebutter](https://givebutter.com) f
 
 ---
 
-## 0. How it works, in plain English
+## 0. How it works
 
 *(Start here if you are not a developer. The technical sections follow.)*
 
